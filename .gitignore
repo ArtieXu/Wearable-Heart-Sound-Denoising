@@ -17,3 +17,12 @@ env/
 
 # Claude Code workspace
 .claude/
+
+# Large raw data (not tracked in git; share separately)
+*.npz
+**/Resp_*_PCM.txt
+**/*_summary.txt
+
+# Local proposal PDFs
+Final_Project_Proposal.pdf
+EE_596_Final_Project.pdf

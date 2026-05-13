@@ -23,12 +23,16 @@ Provided:
     - solve_mm(...)                     : majorization-minimization with O(n) tridiag solve
     - check_gradient(...)               : finite-difference gradient verification
 
-References (proposal):
+References:
     Selesnick & Chen 2013 (OGS-TV / MM)
     Deng & Han 2018 (adaptive OGS for heart sound)
     Huber 1964 (robust loss)
     Beck & Teboulle 2009 (FISTA)
     O'Donoghue & Candes 2015 (adaptive restart)
+
+Credits:
+    - Code by Zechen Xu, zechenxu@uw.edu, 2026-05
+    - claude code xsreview and suggestions
 """
 
 from __future__ import annotations

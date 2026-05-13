@@ -1,18 +1,19 @@
 """
-Warm-up demo for reference-guided PCG denoising.
+Warm-up demo for reference-guided PCG denoising on the 2MIC dataset.
 
 Pipeline:
-  1. Load mic_speaking.wav and mic_walking.wav.
-  2. Band-pass to 25-150 Hz (the PCG band) and resample to FS_TARGET.
-  3. Take a NOISY_FILE as observation y, the OTHER one as the reference z
-     (warm-up only -- in production, z would be a clinically clean baseline).
+  1. Load a noisy 8-s window from data/2MIC/talking/talking.npz (x_dev2).
+  2. Load a quiet reference window from data/2MIC/sitting quiet/2/sit_quiet.npz (x_dev2).
+  3. Band-pass to 25-150 Hz (PCG band) at the native 4 kHz rate.
   4. Phase-align z to y by cross-correlation with optimal scale.
   5. Run MM and GD solvers; plot waveforms, spectrograms, objective curves.
 
 Usage:
-    python demo.py                         # default: noisy=data/mic_walking.wav, ref=data/mic_speaking.wav
-    python demo.py --noisy data/mic_speaking.wav --ref data/mic_walking.wav
-    python demo.py --no-ref                # disable reference term (lambda_r=0)
+    python demo.py                           # defaults: talking x_dev2 vs sit_quiet/2 x_dev2
+    python demo.py --window-idx 50           # try a different talking window
+    python demo.py --ref-window-idx 100      # try a different quiet window
+    python demo.py --dev 1                   # use x_dev1 instead of x_dev2
+    python demo.py --no-ref                  # disable reference term (lambda_r=0)
 """
 
 from __future__ import annotations
@@ -24,41 +25,42 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.io import wavfile
-from scipy.signal import butter, sosfiltfilt, resample_poly, spectrogram
+from scipy.signal import butter, sosfiltfilt, spectrogram
 
 import pcg_denoise as pd
 
 
-FS_TARGET = 2000           # Hz; 2 kHz is well above PCG band (<=150 Hz)
+FS_TARGET = 4000           # Hz; native sample rate of the 2MIC .npz datasets
 PCG_BAND = (25.0, 150.0)
 
 
 # ---------------------------------------------------------------------------
-def load_wav_float(path: str) -> tuple[int, np.ndarray]:
-    """Read a wav file and return (sr, signal-in-[-1,1])."""
-    sr, x = wavfile.read(path)
-    if x.ndim == 2:
-        x = x.mean(axis=1)
-    if np.issubdtype(x.dtype, np.integer):
-        max_abs = float(np.iinfo(x.dtype).max)
-        x = x.astype(np.float64) / max_abs
-    else:
-        x = x.astype(np.float64)
-    return sr, x
+def load_npz_window(path: str, dev: int, window_idx: int) -> tuple[int, np.ndarray]:
+    """Load one 8-s window from a 2MIC session .npz file.
+
+    Returns (sample_rate_hz, signal) where signal is peak-normalized to [-1, 1].
+    """
+    data = np.load(path, allow_pickle=True)
+    key = f"x_dev{dev}"
+    if key not in data.files:
+        raise KeyError(f"{path} has no key {key!r}; available: {data.files}")
+    n_win = data[key].shape[0]
+    if not (0 <= window_idx < n_win):
+        raise IndexError(f"window_idx {window_idx} out of [0, {n_win}) for {path}")
+    sig = data[key][window_idx].astype(np.float64)
+    peak = float(np.max(np.abs(sig)))
+    if peak > 0:
+        sig = sig / peak
+    sr = float(data["meta"].item()["sample_rate_hz"])
+    return int(sr), sig
 
 
-def preprocess(x: np.ndarray, sr_in: int, sr_out: int = FS_TARGET,
+def preprocess(x: np.ndarray, sr_in: int,
                band: tuple[float, float] = PCG_BAND) -> np.ndarray:
-    """Band-pass to PCG band, then polyphase-resample to sr_out."""
+    """Band-pass to PCG band (no resample; the .npz is already at FS_TARGET)."""
     nyq = 0.5 * sr_in
     sos = butter(4, [band[0] / nyq, band[1] / nyq], btype="bandpass", output="sos")
-    x_bp = sosfiltfilt(sos, x)
-
-    # Rational resample sr_in -> sr_out via gcd
-    from math import gcd
-    g = gcd(sr_in, sr_out)
-    up, down = sr_out // g, sr_in // g
-    return resample_poly(x_bp, up, down)
+    return sosfiltfilt(sos, x)
 
 
 # ---------------------------------------------------------------------------
@@ -72,19 +74,25 @@ def snr_db(clean: np.ndarray, noisy: np.ndarray) -> float:
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--noisy", default="data/mic_walking.wav",
-                    help="WAV used as the noisy observation y")
-    ap.add_argument("--ref", default="data/mic_speaking.wav",
-                    help="WAV used as the reference z (warm-up proxy)")
+    ap.add_argument("--talking-npz", default="data/2MIC/talking/talking.npz",
+                    help="Talking session .npz used as the noisy observation y")
+    ap.add_argument("--ref-npz", default="data/2MIC/sitting quiet/2/sit_quiet.npz",
+                    help="Sitting-quiet session .npz used as the reference z")
+    ap.add_argument("--dev", type=int, default=2, choices=(1, 2),
+                    help="Which device channel to use (x_dev1 or x_dev2). Default: 2.")
+    ap.add_argument("--window-idx", type=int, default=17,
+                    help="Which talking window to denoise. Default 17 = median-RMS region.")
+    ap.add_argument("--ref-window-idx", type=int, default=2,
+                    help="Which sitting-quiet window to use as reference. Default 2 = first clean window (win 0 has a start-up transient).")
     ap.add_argument("--no-ref", action="store_true",
                     help="set lambda_r = 0 (skip reference attraction term)")
     ap.add_argument("--lambda-g", type=float, default=0.05)
     ap.add_argument("--lambda-r", type=float, default=0.5)
-    ap.add_argument("--K", type=int, default=50,
-                    help="OGS group size (samples). Default 50 = 25ms at 2kHz.")
+    ap.add_argument("--K", type=int, default=100,
+                    help="OGS group size (samples). Default 100 = 25ms at 4kHz.")
     ap.add_argument("--eps", type=float, default=1e-3)
     ap.add_argument("--delta", type=float, default=None,
-                    help="Huber knee. Default = noise std estimate.")
+                    help="Huber knee. Default = 3 * MAD noise estimate.")
     ap.add_argument("--max-sec", type=float, default=8.0,
                     help="Truncate to first N seconds for the demo.")
     ap.add_argument("--mm-iters", type=int, default=80)
@@ -94,18 +102,23 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    print(f"[demo] noisy = {args.noisy}")
-    print(f"[demo] ref   = {args.ref}")
+    print(f"[demo] noisy : {args.talking_npz}  (x_dev{args.dev}, window {args.window_idx})")
+    print(f"[demo] ref   : {args.ref_npz}  (x_dev{args.dev}, window {args.ref_window_idx})")
 
-    # --- 1. Load
-    sr_y, y_raw = load_wav_float(args.noisy)
-    sr_z, z_raw = load_wav_float(args.ref)
+    # --- 1. Load one 8-s window from each .npz
+    sr_y, y_raw = load_npz_window(args.talking_npz, dev=args.dev,
+                                  window_idx=args.window_idx)
+    sr_z, z_raw = load_npz_window(args.ref_npz, dev=args.dev,
+                                  window_idx=args.ref_window_idx)
     print(f"[demo] noisy: sr={sr_y} Hz, len={len(y_raw)} ({len(y_raw)/sr_y:.2f}s)")
     print(f"[demo] ref  : sr={sr_z} Hz, len={len(z_raw)} ({len(z_raw)/sr_z:.2f}s)")
+    if sr_y != FS_TARGET or sr_z != FS_TARGET:
+        raise ValueError(f"expected both files at {FS_TARGET} Hz, got "
+                         f"sr_y={sr_y}, sr_z={sr_z}")
 
-    # --- 2. Bandpass + resample to 2 kHz
-    y_full = preprocess(y_raw, sr_y, FS_TARGET, PCG_BAND)
-    z_full = preprocess(z_raw, sr_z, FS_TARGET, PCG_BAND)
+    # --- 2. Bandpass to the PCG band
+    y_full = preprocess(y_raw, sr_y, PCG_BAND)
+    z_full = preprocess(z_raw, sr_z, PCG_BAND)
 
     n_max = int(args.max_sec * FS_TARGET)
     y = y_full[:n_max].astype(np.float64)
@@ -165,13 +178,15 @@ def main():
     t = np.arange(n) / FS_TARGET
     fig, axes = plt.subplots(4, 1, figsize=(10, 9), sharex=False)
 
+    title_tag = f"talking x_dev{args.dev} window {args.window_idx}"
+
     axes[0].plot(t, y, lw=0.8, color="0.4", label="y (noisy)")
     axes[0].plot(t, x_mm, lw=1.0, color="C0", label="x_hat (MM)")
     if lambda_r > 0:
         axes[0].plot(t, z, lw=0.8, color="C2", alpha=0.6, label="z (reference)")
     axes[0].set_xlabel("time [s]")
     axes[0].set_ylabel("amplitude")
-    axes[0].set_title(f"Denoised PCG (MM)  --  {os.path.basename(args.noisy)}")
+    axes[0].set_title(f"Denoised PCG (MM)  --  {title_tag}")
     axes[0].legend(loc="upper right", fontsize=8)
     axes[0].grid(alpha=0.3)
 
@@ -196,8 +211,8 @@ def main():
     axes[2].legend(loc="upper right", fontsize=8)
 
     # spectrogram of y vs x_mm
-    f1, t1, S_y = spectrogram(y, fs=FS_TARGET, nperseg=256, noverlap=192)
-    f2, t2, S_x = spectrogram(x_mm, fs=FS_TARGET, nperseg=256, noverlap=192)
+    f1, t1, S_y = spectrogram(y, fs=FS_TARGET, nperseg=512, noverlap=384)
+    f2, t2, S_x = spectrogram(x_mm, fs=FS_TARGET, nperseg=512, noverlap=384)
     axes[3].pcolormesh(
         t1,
         f1,
@@ -221,6 +236,12 @@ def main():
     x_int = np.clip(x_mm / max(np.max(np.abs(x_mm)), 1e-12), -1, 1)
     wavfile.write(out_wav, FS_TARGET, (x_int * 32767).astype(np.int16))
     print(f"[demo] wav saved   -> {out_wav}")
+
+    # Save undenoised (noisy) waveform
+    out_noisy_wav = os.path.join(args.out_dir, "noisy.wav")
+    y_int = np.clip(y / max(np.max(np.abs(y)), 1e-12), -1, 1)
+    wavfile.write(out_noisy_wav, FS_TARGET, (y_int * 32767).astype(np.int16))
+    print(f"[demo] wav saved   -> {out_noisy_wav}")
 
 
 if __name__ == "__main__":
